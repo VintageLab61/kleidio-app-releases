@@ -1,0 +1,33 @@
+# Neue Version in Discord melden (🆕┃app-updates, vom Kleidio-Bot). Läuft bei jedem veröffentlichten Release, auch
+# Vorabversionen. Von Hand: Actions › Discord-Post › Run workflow (Tag leer = neueste Version).
+name: Discord-Post
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag, zum Beispiel v0.2.0-beta.14 (leer = neueste Version)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-post
+  cancel-in-progress: false
+
+jobs:
+  posten:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: In app-updates posten
+        run: python3 .github/scripts/discord_post.py
+        env:
+          KLEIDIO_BOT_TOKEN: ${{ secrets.KLEIDIO_BOT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
