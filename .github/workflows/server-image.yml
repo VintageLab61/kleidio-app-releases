@@ -1,0 +1,153 @@
+# Docker-Image für den Kleidio-Server bauen (24.10.2026, Kleidio 24/7 Phase P1, Max: „P1 in der normalen Form: Docker-Image über
+# GitHub, Installer und Selbst-Update mit Signaturprüfung“). Gehört ins Releases-Repo VintageLab61/kleidio-app-releases als
+# .github/workflows/server-image.yml, daneben der Ordner server/ (Kopie aus kleidio-desktop/server: Dockerfile,
+# Dockerfile.dockerignore, start.sh, app-wahl.sh, release-key.pem, seccomp-kleidio.json, signatur-pruefen.mjs), dazu
+# dependabot.yml als .github/dependabot.yml.
+#
+# Läuft bei jedem veröffentlichten Release und von Hand (Actions › Server-Image › Run workflow, Tag leer = neueste Version):
+#   1. wartet, bis Kleidio-<version>-linux-x64.tar.gz, -linux-arm64.tar.gz und kleidio-signatur.json im Release liegen,
+#   2. prüft beide Archive gegen die Signatur (Ed25519, öffentlicher Release-Schlüssel, server/signatur-pruefen.mjs),
+#   3. entpackt sie nach dist/linux-unpacked und dist/linux-arm64-unpacked,
+#   4. baut das Image für linux/amd64 und linux/arm64 und legt es als ghcr.io/vintagelab61/kleidio-server:<version> ab, dazu
+#      :latest, wenn das Release das neueste ist (ein älterer Tag von Hand verschiebt :latest nie zurück).
+# Keine Secrets nötig, nur das GITHUB_TOKEN des Laufs (packages: write). Die Discord-Meldung (discord.yml) bleibt getrennt.
+# Security-Review 24.10.2026 (Fund 1): Actions auf Commit-SHA gepinnt (Version als Kommentar), QEMU- und BuildKit-Image per Digest;
+# dependabot.yml daneben hält die Pins aktuell. :latest setzt ein eigener Schritt erst nach dem Push und fragt dafür
+# releases/latest direkt davor noch einmal ab (Fund 5).
+name: Server-Image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag, zum Beispiel v0.2.0-beta.107 (leer = neueste Version)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+# Eine Gruppe für alle Läufe (Security-Review 24.10.2026, Fund 5): nie zwei Bauten gleichzeitig, die sich um :latest streiten.
+concurrency:
+  group: server-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/vintagelab61/kleidio-server
+
+jobs:
+  bauen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Tag und Version bestimmen
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_RELEASE: ${{ github.event.release.tag_name }}
+          TAG_EINGABE: ${{ inputs.tag }}
+        run: |
+          set -eu
+          neueste=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          tag="${TAG_RELEASE:-${TAG_EINGABE:-}}"
+          [ -n "$tag" ] || tag="$neueste"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-[0-9A-Za-z]{1,20}(\.[0-9A-Za-z]{1,20}){0,4})?$'; then
+            echo "Tag ungültig: $tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Baue $tag (neueste: $neueste)"
+
+      - name: Linux-Archive und Signatur laden (wartet bis zu 30 Minuten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          x64="Kleidio-$VERSION-linux-x64.tar.gz"
+          arm="Kleidio-$VERSION-linux-arm64.tar.gz"
+          mkdir -p assets
+          for versuch in $(seq 1 40); do
+            namen=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | select((.state // "uploaded") == "uploaded") | .name')
+            if printf '%s\n' "$namen" | grep -qxF "$x64" && printf '%s\n' "$namen" | grep -qxF "$arm" && printf '%s\n' "$namen" | grep -qxF kleidio-signatur.json; then
+              gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D assets --clobber -p "$x64" -p "$arm" -p kleidio-signatur.json
+              break
+            fi
+            echo "Warte auf die Linux-Archive ($versuch/40) ..."
+            sleep 45
+          done
+          if [ ! -f "assets/$x64" ] || [ ! -f "assets/$arm" ] || [ ! -f assets/kleidio-signatur.json ]; then
+            echo "Im Release $TAG fehlen $x64, $arm oder kleidio-signatur.json (npm run paketieren:server, release:signieren, hochladen)."
+            exit 1
+          fi
+
+      - name: Signatur prüfen (vor dem Bauen)
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: node server/signatur-pruefen.mjs assets "$VERSION"
+
+      - name: Archive entpacken
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p ctx/dist/linux-unpacked ctx/dist/linux-arm64-unpacked ctx/server
+          tar -xzf "assets/Kleidio-$VERSION-linux-x64.tar.gz" -C ctx/dist/linux-unpacked --no-same-owner
+          tar -xzf "assets/Kleidio-$VERSION-linux-arm64.tar.gz" -C ctx/dist/linux-arm64-unpacked --no-same-owner
+          for d in ctx/dist/linux-unpacked ctx/dist/linux-arm64-unpacked; do
+            test -x "$d/kleidio"
+            test "$(cat "$d/kleidio-version")" = "$VERSION"
+          done
+          cp server/Dockerfile server/Dockerfile.dockerignore server/start.sh server/app-wahl.sh server/release-key.pem ctx/server/
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+          image: tonistiigi/binfmt:qemu-v10.0.4@sha256:8f58e6214f4cc9dc83ce8f5acad1ece508eb6b20e696a8c1e9f274481982c541
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:v0.25.1@sha256:79cc6476ab1a3371c9afd8b44e7c55610057c43e18d9b39b68e2b0c2475cc1b6
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: bau
+        with:
+          context: ctx
+          file: ctx/server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            KLEIDIO_VERSION=${{ steps.v.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+
+      - name: latest setzen, wenn das Release noch das neueste ist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          VERSION: ${{ steps.v.outputs.version }}
+          DIGEST: ${{ steps.bau.outputs.digest }}
+        run: |
+          set -eu
+          neueste=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [ "$neueste" != "$TAG" ]; then
+            echo "Neuestes Release ist jetzt $neueste, $TAG bekommt kein :latest."
+            exit 0
+          fi
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$DIGEST"
+          echo "$IMAGE:latest zeigt auf $VERSION ($DIGEST). Für install.sh: KLEIDIO_IMAGE_DIGEST=\"$DIGEST\""

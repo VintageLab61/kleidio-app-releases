@@ -1,0 +1,8 @@
+# Pins der GitHub Actions aktuell halten (24.10.2026, Security-Review P1, Fund 1). Gehört ins Releases-Repo
+# VintageLab61/kleidio-app-releases als .github/dependabot.yml. Dependabot schlägt neue Commit-SHAs als Pull Request vor.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,0 +1,8 @@
+# Nur das, was das Image braucht (24.10.2026, Kleidio 24/7 Phase P1). Gilt für docker build -f server/Dockerfile (BuildKit
+# liest <Dockerfile>.dockerignore), lokal im Repo (sonst ginge node_modules mit) und in der GitHub Action.
+*
+!dist/linux-unpacked
+!dist/linux-arm64-unpacked
+!server/start.sh
+!server/app-wahl.sh
+!server/release-key.pem
